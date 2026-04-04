@@ -16,9 +16,9 @@ from lexnote.engine import populate_signature, inject_signature_to_mime
 
 class LexnoteProductionHandler:
     def __init__(self):
-        # Paths from your successful Certbot run
-        self.cert_chain = '/etc/letsencrypt/live/smtp.lexnote.org/fullchain.pem'
-        self.priv_key = '/etc/letsencrypt/live/smtp.lexnote.org/privkey.pem'
+        # Unified Wildcard Paths
+        self.cert_chain = '/etc/letsencrypt/live/lexnote.org/fullchain.pem'
+        self.priv_key = '/etc/letsencrypt/live/lexnote.org/privkey.pem'
         
         # Create SSL context for the Outbound leg (Lexnote -> M365)
         self.ssl_context = ssl.create_default_context()
