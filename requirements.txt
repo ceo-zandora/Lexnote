@@ -1,0 +1,7 @@
+django
+psycopg2-binary
+celery
+redis
+requests-oauthlib
+beautifulsoup4
+aiosmtpd
