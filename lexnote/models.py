@@ -30,6 +30,9 @@ class TenantDomain(models.Model):
     tenant = models.ForeignKey(Tenant, related_name='domains', on_delete=models.CASCADE)
     domain_name = models.CharField(max_length=255, unique=True) # e.g. zanx.com
 
+    def __str__(self):
+        return f"{self.tenant.name} - {self.domain_name}"
+
 # --- SIGNATURE LAYER ---
 class SignatureTemplate(models.Model):
     name = models.CharField(max_length=100)
