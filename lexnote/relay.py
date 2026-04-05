@@ -11,6 +11,11 @@ from asgiref.sync import sync_to_async
 
 import os
 import django
+import sys
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(BASE_DIR)
+
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
 django.setup()
 
