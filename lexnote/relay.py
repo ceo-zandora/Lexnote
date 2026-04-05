@@ -1,28 +1,36 @@
+import os
+import sys
+import django
 import asyncio
 import logging
 import email
 import ssl
 import smtplib
+import time
+from pathlib import Path
 from email import policy
-from aiosmtpd.smtp import SMTP
 from aiosmtpd.controller import Controller
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 
-import os
-import django
-import sys
-from pathlib import Path
-
+# --- Django Bootstrap ---
+# This ensures the script can find 'core' and 'lexnote' apps
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 django.setup()
 
+# Local Imports after Django Setup
 from lexnote.models import Tenant, TransactionLog, TransactionEvent
 from lexnote.engine import SignatureEngine
 
+# --- Logging Configuration ---
+# Configured to show in journalctl and the forensic_audit.log
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger('lexnote.smtp')
 
 class LexnoteSMTPHandler:
@@ -40,10 +48,9 @@ class LexnoteSMTPHandler:
         # 1. Parse MIME
         msg = email.message_from_bytes(raw_data, policy=policy.default)
         
-        # --- LOOP PROTECTION CHECK ---
+        # --- LOOP PROTECTION ---
         if msg.get('X-Lexnote-Processed') == 'true':
-            logger.info(f"Loop Detected: Skipping message {msg.get('Message-ID')} already processed by Lexnote.")
-            # We must still relay it back to M365 to break the loop, but WITHOUT processing
+            logger.info(f"Loop Detected: Skipping message {msg.get('Message-ID')}")
             return await self.bypass_loop(msg, mail_from)
 
         # 2. Resolve Tenant
@@ -51,6 +58,7 @@ class LexnoteSMTPHandler:
         tenant = await self.resolve_tenant(mail_from, cross_tenant_id)
         
         if not tenant:
+            logger.error(f"Unauthorized access attempt from {mail_from} (Tenant ID: {cross_tenant_id})")
             return '550 Security Failure: Tenant unauthorized'
 
         # 3. Initialize Transaction
@@ -62,8 +70,7 @@ class LexnoteSMTPHandler:
             engine = SignatureEngine(tenant, tx)
             modified_msg, result_status = await engine.process_message(msg)
 
-            # 5. Inject Forensic Headers before Return
-            # We add these regardless of SIGNED or BYPASS status to prevent re-entry
+            # 5. Inject Forensic Headers
             modified_msg['X-Lexnote-Processed'] = 'true'
             modified_msg['X-Lexnote-TRN'] = str(tx.trn)
 
@@ -85,19 +92,15 @@ class LexnoteSMTPHandler:
             return '250 OK'
 
         except Exception as e:
-            logger.exception("SMTP Processing Error")
+            logger.exception("Internal SMTP Processing Error")
             tx.status = 'failed'
             tx.error_message = str(e)
             await sync_to_async(tx.save)()
             return '451 Local processing error'
 
     async def bypass_loop(self, msg, mail_from):
-        """Relays a message that has already been processed to prevent infinite loops."""
         sender_domain = mail_from.split('@')[-1].lower()
         mx_endpoint = f"{sender_domain.replace('.', '-')}.mail.protection.outlook.com"
-        
-        # We don't create a full TransactionLog here to save DB space on loops, 
-        # just relay it back as is.
         success = await self.relay_to_m365(msg, mx_endpoint, None)
         return '250 OK' if success else '451 Relay Error'
 
@@ -127,7 +130,6 @@ class LexnoteSMTPHandler:
         )
 
     async def relay_to_m365(self, msg, mx_endpoint, tx):
-        """Relays the message back to M365 using TLS."""
         def send():
             try:
                 with smtplib.SMTP(mx_endpoint, 25, timeout=30) as smtp:
@@ -135,37 +137,38 @@ class LexnoteSMTPHandler:
                     smtp.send_message(msg)
                 return True
             except Exception as e:
-                logger.error(f"Relay Error: {e}")
+                logger.error(f"Outbound Relay Error to {mx_endpoint}: {e}")
                 return False
-
         return await asyncio.to_thread(send)
 
 def run_smtp_server():
     handler = LexnoteSMTPHandler()
     
-    # Inbound SSL (M365 -> Lexnote)
+    # Inbound SSL Configuration
     inbound_ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     inbound_ssl_context.load_cert_chain(handler.cert_chain, handler.priv_key)
 
-    # Note: We set 'ready_timeout' to handle slow handshakes in production
+    # Controller setup using modern TLS context and no mandatory STARTTLS
     controller = Controller(
         handler, 
         hostname='0.0.0.0', 
         port=25, 
-        ssl_context=inbound_ssl_context
+        tls_context=inbound_ssl_context,
+        require_starttls=False
     )
     
     controller.start()
-    print(f"Lexnote Secure Relay active on port 25...")
-
-    # This creates a persistent event loop that blocks forever
-    loop = asyncio.get_event_loop()
+    logger.info("Lexnote Secure Relay started on port 25...")
+    
     try:
-        loop.run_forever()
+        # Keep-alive loop
+        while True:
+            time.sleep(3600)
     except KeyboardInterrupt:
-        print("Shutting down relay...")
+        logger.info("Relay received shutdown signal...")
     finally:
         controller.stop()
+        logger.info("Relay stopped.")
 
 if __name__ == "__main__":
     run_smtp_server()
