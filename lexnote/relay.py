@@ -1,154 +1,130 @@
 import asyncio
-import os
-import django
+import logging
 import email
-import smtplib
 import ssl
-import dns.resolver
+import smtplib
+from email import policy
+from aiosmtpd.smtp import SMTP
 from aiosmtpd.controller import Controller
+from django.utils import timezone
+from asgiref.sync import sync_to_async
 
-# 1. Initialize Django Environment
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
-django.setup()
+from lexnote.models import Tenant, TransactionLog, TransactionEvent
+from lexnote.engine import SignatureEngine
 
-from lexnote.models import Tenant, DirectoryUser, TransactionLog, SignaturePolicy
-from lexnote.engine import populate_signature, inject_signature_to_mime
+logger = logging.getLogger('lexnote.smtp')
 
-class LexnoteProductionHandler:
+class LexnoteSMTPHandler:
     def __init__(self):
-        # Unified Wildcard Paths
+        # Unified Wildcard Path Configuration
         self.cert_chain = '/etc/letsencrypt/live/lexnote.org/fullchain.pem'
         self.priv_key = '/etc/letsencrypt/live/lexnote.org/privkey.pem'
         
-        # Create SSL context for the Outbound leg (Lexnote -> M365)
-        self.ssl_context = ssl.create_default_context()
-
-    def get_mx_record(self, domain):
-        """Finds the M365 Inbound Endpoint for the recipient domain."""
-        try:
-            answers = dns.resolver.resolve(domain, 'MX')
-            # Get the record with the lowest preference number
-            best_mx = sorted(answers, key=lambda r: r.preference)[0].exchange.to_text()
-            return best_mx.rstrip('.')
-        except Exception as e:
-            print(f"DNS MX Lookup failed for {domain}: {e}")
-            return None
+        # SSL Context for Outbound (Lexnote -> M365)
+        self.outbound_ssl_context = ssl.create_default_context()
 
     async def handle_DATA(self, server, session, envelope):
+        peer = session.peer
+        mail_from = envelope.mail_from
+        rcpt_tos = envelope.rcpt_tos
         raw_data = envelope.content
-        sender = envelope.mail_from
-        recipients = envelope.rcpt_tos
         
-        # Identify Tenant via Subdomain (e.g., ZANX.smtp.lexnote.org)
-        target_hostname = getattr(session, 'host_name', 'UNKNOWN').lower()
-        relay_token = target_hostname.split('.')[0].upper()
-
-        # Parse email for headers
-        msg = email.message_from_bytes(raw_data)
-        message_id = msg.get('Message-ID', 'N/A')
-
-        # 2. Identify Tenant & Log Entry
-        tenant = Tenant.objects.filter(relay_token=relay_token).first()
+        # 1. Parse MIME with Standard Policy
+        msg = email.message_from_bytes(raw_data, policy=policy.default)
         
-        log = TransactionLog.objects.create(
-            tenant=tenant if tenant else Tenant.objects.first(),
+        # 2. CISO-Grade Tenant Resolution
+        # Using the immutable Microsoft Cross-Tenant ID header
+        cross_tenant_id = msg.get('X-MS-Exchange-CrossTenant-Id')
+        tenant = await self.resolve_tenant(mail_from, cross_tenant_id)
+        
+        if not tenant:
+            logger.warning(f"Relay Denied: No active tenant for ID {cross_tenant_id} or Domain {mail_from}")
+            return '550 Security Failure: Tenant unauthorized'
+
+        # 3. Initialize Transaction
+        tx = await self.create_transaction(tenant, mail_from, rcpt_tos, msg.get('Message-ID'), cross_tenant_id)
+        await self.log_event(tx, 'received', f"Secure Inbound from {peer[0]}")
+
+        try:
+            # 4. Process Signature
+            engine = SignatureEngine(tenant, tx)
+            modified_msg, result_status = await engine.process_message(msg)
+
+            # 5. Secure Return Path
+            if result_status in ['SIGNED', 'BYPASS']:
+                # Determine MX Endpoint: sender_domain + mail.protection.outlook.com
+                sender_domain = mail_from.split('@')[-1].lower()
+                mx_endpoint = f"{sender_domain.replace('.', '-')}.mail.protection.outlook.com"
+                
+                relay_success = await self.relay_to_m365(modified_msg, mx_endpoint, tx)
+                
+                if relay_success:
+                    tx.status = 'returned'
+                    await self.log_event(tx, 'returned_to_m365', f"Relayed via TLS to {mx_endpoint}")
+                else:
+                    tx.status = 'failed'
+                    await self.log_event(tx, 'processing_failed', "Outbound TLS Relay Failed", level='error')
+            
+            await sync_to_async(tx.save)()
+            return '250 OK'
+
+        except Exception as e:
+            logger.exception("SMTP Processing Error")
+            tx.status = 'failed'
+            tx.error_message = str(e)
+            await sync_to_async(tx.save)()
+            return '451 Local processing error'
+
+    async def resolve_tenant(self, mail_from, cross_tenant_id):
+        """Resolves tenant via Microsoft Header (Primary) or Domain (Fallback)."""
+        if cross_tenant_id:
+            tenant = await sync_to_async(Tenant.objects.filter(tenant_id=cross_tenant_id, is_active=True).first)()
+            if tenant: return tenant
+        
+        domain = mail_from.split('@')[-1].lower()
+        return await sync_to_async(Tenant.objects.filter(domain__iexact=domain, is_active=True).first)()
+
+    @sync_to_async
+    def create_transaction(self, tenant, sender, recipients, msg_id, cross_id):
+        return TransactionLog.objects.create(
+            tenant=tenant,
+            trigger_type='MAIL',
             sender=sender,
-            recipient=", ".join(recipients),
-            message_id=message_id,
-            status='failed'
+            recipients={'to': recipients},
+            internet_message_id=msg_id,
+            cross_tenant_id=cross_id,
+            status='processing'
         )
 
-        try:
-            # 3. Validation & Loop Prevention
-            if not tenant:
-                log.processing_notes = f"Unknown Relay Token: {relay_token}"
-                log.save()
-                self.relay_to_m365(raw_data, sender, recipients)
-                return '250 OK'
+    async def log_event(self, tx, event_type, message, level='info'):
+        await sync_to_async(TransactionEvent.objects.create)(
+            transaction=tx, event_type=event_type, level=level, message=message
+        )
 
-            if msg.get('X-Lexnote-Processed') == 'true':
-                log.status = 'bypassed'
-                log.processing_notes = "Loop Detection: Skipping."
-                log.save()
-                self.relay_to_m365(raw_data, sender, recipients)
-                return '250 OK'
+    async def relay_to_m365(self, msg, mx_endpoint, tx):
+        """Relays the message back to M365 using TLS."""
+        def send():
+            try:
+                with smtplib.SMTP(mx_endpoint, 25, timeout=30) as smtp:
+                    smtp.starttls(context=self.outbound_ssl_context)
+                    smtp.send_message(msg)
+                return True
+            except Exception as e:
+                logger.error(f"Relay Error: {e}")
+                return False
 
-            # 4. Signature Logic
-            user = DirectoryUser.objects.filter(email=sender, tenant=tenant, is_active=True).first()
-            if not user:
-                log.status = 'bypassed'
-                log.processing_notes = "User not found in Directory."
-                log.save()
-                self.relay_to_m365(raw_data, sender, recipients)
-                return '250 OK'
+        return await asyncio.to_thread(send)
 
-            # Determine if Initial or Reply
-            is_reply = 'In-Reply-To' in msg or 'References' in msg
-            policy = SignaturePolicy.objects.filter(tenant=tenant).first()
-            
-            if not policy:
-                raise ValueError("No Signature Policy found for tenant.")
+# --- Server Lifecycle with Inbound SSL ---
 
-            template = policy.reply_template if is_reply and policy.reply_template else policy.initial_template
-            
-            # 5. Inject Signature
-            populated_sig = populate_signature(template.html_content, user)
-            processed_bytes = inject_signature_to_mime(raw_data, populated_sig)
-
-            # 6. Final Header Injection (CISO Forensics)
-            final_msg = email.message_from_bytes(processed_bytes)
-            del final_msg['X-Lexnote-Processed'] # Clear old ones
-            del final_msg['X-Lexnote-TXN']
-            
-            final_msg['X-Lexnote-Processed'] = 'true'
-            final_msg['X-Lexnote-TXN'] = log.trn
-            
-            # 7. Deliver back to M365
-            self.relay_to_m365(final_msg.as_bytes(), sender, recipients)
-
-            log.status = 'signed'
-            log.is_reply = is_reply
-            log.save()
-            print(f"[{log.trn}] SUCCESS: Processed mail for {sender}")
-            return '250 OK'
-
-        except Exception as e:
-            log.processing_notes = f"Relay Error: {str(e)}"
-            log.save()
-            print(f"[{log.trn}] FAIL-SAFE: Relaying original due to error: {e}")
-            self.relay_to_m365(raw_data, sender, recipients)
-            return '250 OK'
-
-    def relay_to_m365(self, data, sender, recipients):
-        """Delivers mail to the destination MX via Port 25 with STARTTLS."""
-        domain = sender.split('@')[-1]
-        mx_endpoint = self.get_mx_record(domain)
-        
-        if not mx_endpoint:
-            print(f"Critical: No destination found for {domain}")
-            return
-
-        try:
-            # Connect to M365 on Port 25
-            with smtplib.SMTP(mx_endpoint, 25, timeout=20) as server:
-                server.ehlo('smtp.lexnote.org')
-                if server.has_extn('STARTTLS'):
-                    server.starttls(context=self.ssl_context)
-                    server.ehlo()
-                server.sendmail(sender, recipients, data)
-        except Exception as e:
-            print(f"SMTP Outbound Error to {mx_endpoint}: {e}")
-
-if __name__ == '__main__':
-    # Initialize the Handler
-    handler = LexnoteProductionHandler()
+def run_smtp_server():
+    handler = LexnoteSMTPHandler()
     
-    # Define SSL for Inbound connection (M365 -> Lexnote)
-    # This allows M365 to verify our identity via the certs you just made
+    # Create SSL context for the Inbound leg (M365 -> Lexnote)
     inbound_ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     inbound_ssl_context.load_cert_chain(handler.cert_chain, handler.priv_key)
 
-    # Start the Controller on Port 25 (Requires sudo/root)
+    # Controller handles the async loop and socket
     controller = Controller(
         handler, 
         hostname='0.0.0.0', 
@@ -156,15 +132,10 @@ if __name__ == '__main__':
         ssl_context=inbound_ssl_context
     )
     
-    print("==================================================")
-    print("   LEXNOTE SECURE RELAY ACTIVE ON PORT 25         ")
-    print("   SSL: ENABLED (*.smtp.lexnote.org)              ")
-    print("==================================================")
-    
+    print(f"Lexnote Secure Relay active on port 25 (SSL Enabled)")
     controller.start()
     
-    loop = asyncio.get_event_loop()
     try:
-        loop.run_forever()
+        asyncio.get_event_loop().run_forever()
     except KeyboardInterrupt:
         controller.stop()

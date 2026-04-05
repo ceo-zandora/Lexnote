@@ -1,139 +1,191 @@
 from django.db import models
 import uuid
 
-def generate_relay_token():
-    return uuid.uuid4().hex[:12].upper()
-
 def generate_trn():
+    """
+    Human-readable Transaction Reference Number
+    Example: TRN6F13A9C3D2B1
+    """
     return f"TRN{uuid.uuid4().hex[:12].upper()}"
 
-# --- TENANT LAYER ---
-class Tenant(models.Model):
-    # The X-MS-Exchange-CrossTenant-id from Microsoft
-    tenant_id = models.UUIDField(unique=True, primary_key=True)
-    organization_name = models.CharField(max_length=255)
-    
-    # Randomized string for the Smart Host: {relay_token}.lexnote.org
-    relay_token = models.CharField(max_length=20, default=generate_relay_token, unique=True)
-    
-    # Credentials for Graph API Sync
+class TimeStampedModel(models.Model):
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        abstract = True
+
+class Tenant(TimeStampedModel):
+    name = models.CharField(max_length=255)
+    tenant_id = models.CharField(max_length=255, unique=True, help_text="M365 Directory ID")
     client_id = models.CharField(max_length=255)
     client_secret = models.CharField(max_length=255)
-    
+    relay_domain = models.CharField(max_length=255, unique=True, help_text="e.g. x1y2.smtp.lexnote.org")
     is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    last_sync = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
-        return self.organization_name
+        return f"{self.name} ({self.tenant_id})"
 
-class TenantDomain(models.Model):
-    tenant = models.ForeignKey(Tenant, related_name='domains', on_delete=models.CASCADE)
-    domain_name = models.CharField(max_length=255, unique=True) # e.g. zanx.com
+class Group(TimeStampedModel):
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="groups")
+    external_id = models.CharField(max_length=255, unique=True)
+    display_name = models.CharField(max_length=255)
+    mail_enabled = models.BooleanField(default=False)
+    security_enabled = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True, db_index=True)
 
     def __str__(self):
-        return f"{self.tenant.name} - {self.domain_name}"
+        return f"{self.display_name} - ({self.tenant.tenant_id})"
 
-# --- SIGNATURE LAYER ---
-class SignatureTemplate(models.Model):
-    name = models.CharField(max_length=100)
-    html_content = models.TextField() # The raw HTML with {{tags}}
-    
-    TYPE_CHOICES = [
-        ('initial', 'Initial Email'),
-        ('reply', 'Reply/Forward'),
-        ('universal', 'Universal (Both)'),
-    ]
-    sig_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default='universal')
-
-class SignaturePolicy(models.Model):
-    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
-    priority = models.IntegerField(default=0) # 0 = Highest Priority
-    
-    # Conditional Logic (Filters)
-    target_domain = models.ForeignKey(TenantDomain, on_delete=models.SET_NULL, null=True, blank=True)
-    target_country = models.CharField(max_length=100, blank=True)
-    target_department = models.CharField(max_length=100, blank=True)
-    target_company = models.CharField(max_length=255, blank=True) # For multi-company tenants
-    
-    # Template Mapping
-    initial_template = models.ForeignKey(SignatureTemplate, related_name='initial_sig', on_delete=models.CASCADE)
-    reply_template = models.ForeignKey(SignatureTemplate, related_name='reply_sig', on_delete=models.CASCADE, null=True, blank=True)
-
-    class Meta:
-        ordering = ['priority']
-        verbose_name_plural = "Signature Policies"
-
-# --- DIRECTORY LAYER ---
-class DirectoryUser(models.Model):
-    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+class LexUser(TimeStampedModel):
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="users")
+    external_id = models.CharField(max_length=255, unique=True)
     email = models.EmailField(unique=True)
-    first_name = models.CharField(max_length=100)
-    last_name = models.CharField(max_length=100)
-    designation = models.CharField(max_length=255)
-    department = models.CharField(max_length=100)
-    company_name = models.CharField(max_length=255)
-    country = models.CharField(max_length=100)
-    phone = models.CharField(max_length=20)
-    office_phone = models.CharField(max_length=20, blank=True)
-    is_active = models.BooleanField(default=True)
-    last_synced = models.DateTimeField(auto_now=True)
+    upn = models.EmailField()
+    display_name = models.CharField(max_length=255)
+    first_name = models.CharField(max_length=255, blank=True, null=True)
+    last_name = models.CharField(max_length=255, blank=True, null=True)
+    employee_id = models.CharField(max_length=100, blank=True, null=True)
+    designation = models.CharField(max_length=255, blank=True, null=True)
+    department = models.CharField(max_length=255, blank=True, null=True)
+    office_location = models.CharField(max_length=255, blank=True, null=True)
+    company_name = models.CharField(max_length=255, blank=True, null=True)
+    city = models.CharField(max_length=100, blank=True, null=True)
+    state = models.CharField(max_length=100, blank=True, null=True)
+    mobile_phone = models.CharField(max_length=50, blank=True, null=True)
+    office_phone = models.CharField(max_length=50, blank=True, null=True)
+    fax_number = models.CharField(max_length=50, blank=True, null=True)
+    is_active = models.BooleanField(default=True, db_index=True)
     
-    class Meta:
-        indexes = [models.Index(fields=['email', 'tenant'])]
+    groups = models.ManyToManyField(Group, related_name="members")
 
-# --- AUDIT LAYER ---
-class TransactionLog(models.Model):
-    # --- Identification ---
-    # Human-readable TRN (e.g., TRN-A8B2C3D4E5F6)
-    trn = models.CharField(
-        max_length=50, 
-        unique=True, 
-        default=generate_trn,
-        editable=False
-    )
-    # The unique ID from Microsoft for cross-referencing in Exchange Logs
-    message_id = models.CharField(max_length=255, db_index=True, help_text="Original Message-ID header")
+    def __str__(self):
+        return f"{self.email} ({self.tenant.tenant_id})"
+
+class SignatureTemplate(TimeStampedModel):
+    name = models.CharField(max_length=100)
+    html_content = models.TextField(help_text="Use placeholders like {{display_name}}, {{designation}}")
+    
+    def __str__(self):
+        return self.name
+
+class Policy(TimeStampedModel):
+    name = models.CharField(max_length=100)
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
-    
-    # --- Mail Metadata ---
-    sender = models.EmailField(db_index=True)
-    recipient = models.TextField(help_text="Comma-separated list of recipients")
-    subject = models.CharField(max_length=255, blank=True, null=True)
-    timestamp = models.DateTimeField(auto_now_add=True)
+    priority = models.IntegerField(
+        default=0, 
+        help_text="Higher priority policies are evaluated first."
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
 
-    # --- Processing Results ---
-    STATUS_CHOICES = [
-        ('signed', 'Signed'),      # Success: Signature injected
-        ('bypassed', 'Bypassed'),  # Intentional: e.g., S/MIME, Internal, or Duplicate
-        ('failed', 'Failed'),      # Error: Fallback triggered, sent without signature
-    ]
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+    # --- INCLUSION CRITERIA (Targeting) ---
+    target_users = models.ManyToManyField(
+        LexUser, blank=True, related_name="targeted_by_policies"
+    )
+    target_groups = models.ManyToManyField(
+        Group, blank=True, related_name="targeted_by_policies"
+    )
     
-    # Logic Tracking
-    is_reply = models.BooleanField(default=False, help_text="Detected via In-Reply-To header")
-    policy_applied = models.ForeignKey(
-        SignaturePolicy, 
-        null=True, 
-        blank=True, 
-        on_delete=models.SET_NULL,
-        help_text="The specific policy that matched the sender attributes"
+    # Attribute-Based Targeting (Comma-separated or exact match)
+    target_departments = models.TextField(
+        blank=True, help_text="Comma-separated list of departments."
+    )
+    target_cities = models.TextField(
+        blank=True, help_text="Comma-separated list of cities."
+    )
+    target_states = models.TextField(blank=True)
+    target_companies = models.TextField(blank=True)
+    target_office_locations = models.TextField(
+        blank=True, help_text="Matches against the 'city' or 'office_location' field."
     )
 
-    # --- Technical Audit Trail ---
-    # Stores the X-MS-Exchange-CrossTenant-id for verification
-    cross_tenant_id = models.UUIDField(null=True, blank=True)
-    
-    # Detailed log for failed or bypassed reasons
-    # e.g., "Bypassed: application/pkcs7-mime detected (S/MIME)"
-    # e.g., "Failed: User mohammed@zanx.com not found in DirectoryUser sync"
-    processing_notes = models.TextField(blank=True)
+    # --- EXCLUSION CRITERIA (The 'Except' Rule) ---
+    exclude_users = models.ManyToManyField(
+        LexUser, blank=True, related_name="excluded_from_policies"
+    )
+    exclude_groups = models.ManyToManyField(
+        Group, blank=True, related_name="excluded_from_policies"
+    )
+    exclude_departments = models.TextField(blank=True)
+
+    # --- SIGNATURE ASSIGNMENT ---
+    initial_signature = models.ForeignKey(
+        SignatureTemplate, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        related_name="initial_policy"
+    )
+    reply_signature = models.ForeignKey(
+        SignatureTemplate, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        related_name="reply_policy"
+    )
 
     class Meta:
-        ordering = ['-timestamp']
+        verbose_name_plural = "Policies"
+        ordering = ['-priority']
         indexes = [
-            models.Index(fields=['trn', 'sender']),
-            models.Index(fields=['timestamp', 'status']),
+            models.Index(fields=['tenant', 'is_active', 'priority']),
         ]
 
     def __str__(self):
-        return f"{self.trn} | {self.sender} | {self.status.upper()}"
+        return f"P{self.priority}: {self.name} ({self.tenant.name})"
+
+class TransactionLog(TimeStampedModel):
+    STATUS_CHOICES = [
+        ("received", "Received"),
+        ("processing", "Processing"),
+        ("signed", "Signed"),
+        ("bypassed", "Bypassed"),
+        ("failed", "Failed"),
+        ("returned", "Returned"),
+        ("sync_success", "Sync Success"),
+        ("sync_fail", "Sync Failed"),
+    ]
+
+    tenant = models.ForeignKey('Tenant', on_delete=models.CASCADE, related_name="transactions")
+    trn = models.CharField(max_length=50, unique=True, default=generate_trn, db_index=True)
+    
+    # Identify what triggered this (Email or Sync)
+    trigger_type = models.CharField(max_length=10, choices=[('MAIL', 'Mail Traffic'), ('SYNC', 'Directory Sync')], default='MAIL')
+    
+    # Core Identity
+    sender = models.EmailField(db_index=True, blank=True, null=True)
+    internet_message_id = models.CharField(max_length=998, blank=True, db_index=True)
+    
+    # Status & Resolution
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="received", db_index=True)
+    directory_user = models.ForeignKey('LexUser', null=True, blank=True, on_delete=models.SET_NULL)
+    policy_applied = models.ForeignKey('Policy', null=True, blank=True, on_delete=models.SET_NULL)
+    
+    # Forensic Meta
+    is_reply = models.BooleanField(default=False)
+    processing_notes = models.TextField(blank=True)
+    error_message = models.TextField(blank=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["tenant", "status", "created_at"]),
+            models.Index(fields=["trn", "sender"]),
+        ]
+
+    def __str__(self):
+        return f"{self.trn} | {self.trigger_type} | {self.status}"
+
+class TransactionEvent(TimeStampedModel):
+    """Immutable-ish events for granular traceability."""
+    transaction = models.ForeignKey(TransactionLog, on_delete=models.CASCADE, related_name="events")
+    event_type = models.CharField(max_length=50, db_index=True) # e.g., 'MIME_PARSED', 'GRAPH_AUTH_SUCCESS'
+    level = models.CharField(max_length=10, choices=[('info', 'Info'), ('warn', 'Warning'), ('error', 'Error')], default='info')
+    message = models.TextField()
+    metadata = models.JSONField(default=dict, blank=True) # Store raw API errors or header snippets
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.transaction.trn} | {self.event_type}"
