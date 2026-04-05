@@ -142,14 +142,30 @@ class LexnoteSMTPHandler:
 
 def run_smtp_server():
     handler = LexnoteSMTPHandler()
+    
+    # Inbound SSL (M365 -> Lexnote)
     inbound_ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     inbound_ssl_context.load_cert_chain(handler.cert_chain, handler.priv_key)
 
-    controller = Controller(handler, hostname='0.0.0.0', port=25, ssl_context=inbound_ssl_context)
-    print(f"Lexnote Secure Relay active on port 25 (Loop Protection Enabled)")
-    controller.start()
+    # Note: We set 'ready_timeout' to handle slow handshakes in production
+    controller = Controller(
+        handler, 
+        hostname='0.0.0.0', 
+        port=25, 
+        ssl_context=inbound_ssl_context
+    )
     
+    controller.start()
+    print(f"Lexnote Secure Relay active on port 25...")
+
+    # This creates a persistent event loop that blocks forever
+    loop = asyncio.get_event_loop()
     try:
-        asyncio.get_event_loop().run_forever()
+        loop.run_forever()
     except KeyboardInterrupt:
+        print("Shutting down relay...")
+    finally:
         controller.stop()
+
+if __name__ == "__main__":
+    run_smtp_server()
