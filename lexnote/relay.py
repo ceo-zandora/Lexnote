@@ -12,11 +12,12 @@ from asgiref.sync import sync_to_async
 import os
 import django
 import sys
+from pathlib import Path
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(BASE_DIR)
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings")
 django.setup()
 
 from lexnote.models import Tenant, TransactionLog, TransactionEvent
