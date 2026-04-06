@@ -15,7 +15,7 @@ class SignatureEngine:
 
     async def log_event(self, event_type, message, level='info', meta=None):
         """Helper to link engine steps to the forensic trail."""
-        await sync_to_async(TransactionEvent.objects.create)(
+        await sync_to_async(TransactionEvent.objects.create, thread_sensitive=True)(
             transaction=self.tx,
             event_type=event_type,
             level=level,
@@ -23,26 +23,23 @@ class SignatureEngine:
             metadata=meta or {}
         )
 
-    def get_matching_policy(self, user):
+    def _get_matching_policy_sync(self, user):
         """
-        Evaluates the ABAC (Attribute-Based Access Control) logic.
-        Exclusions always take precedence over Inclusions.
+        Internal synchronous helper to handle complex ORM lookups.
         """
         policies = Policy.objects.filter(
             tenant=self.tenant, 
             is_active=True
-        ).order_by('-priority').prefetch_related('target_groups', 'exclude_groups')
+        ).order_by('-priority')
 
         for policy in policies:
             # --- PHASE 1: EXCLUSIONS ---
-            if user in policy.exclude_users.all():
+            if policy.exclude_users.filter(pk=user.pk).exists():
                 continue
             
-            # Check if user is in an excluded group
             if policy.exclude_groups.filter(members=user).exists():
                 continue
 
-            # Check excluded departments (comma-separated)
             if policy.exclude_departments and user.department:
                 excluded_depts = [d.strip().lower() for d in policy.exclude_departments.split(',')]
                 if user.department.lower() in excluded_depts:
@@ -51,14 +48,12 @@ class SignatureEngine:
             # --- PHASE 2: INCLUSIONS ---
             is_targeted = False
 
-            # A) Direct Targeting
-            if user in policy.target_users.all():
+            if policy.target_users.filter(pk=user.pk).exists():
                 is_targeted = True
             
             if not is_targeted and policy.target_groups.filter(members=user).exists():
                 is_targeted = True
 
-            # B) Attribute-Based Targeting (Dept, City, State, Company)
             if not is_targeted:
                 match_map = {
                     'target_departments': user.department,
@@ -78,13 +73,15 @@ class SignatureEngine:
 
             if is_targeted:
                 return policy
-
         return None
 
+    @sync_to_async
+    def _get_templates_sync(self, policy):
+        """Safely fetch foreign key relations."""
+        return policy.initial_signature, policy.reply_signature
+
     def render_signature(self, template, user):
-        """
-        Replaces placeholders like {{display_name}} with actual user data.
-        """
+        """Replaces placeholders with actual user data."""
         content = template.html_content
         placeholders = {
             '{{display_name}}': user.display_name or "",
@@ -105,53 +102,59 @@ class SignatureEngine:
         
         for key, val in placeholders.items():
             content = content.replace(key, str(val))
-        
         return content
 
     async def process_message(self, mime_msg):
-        """
-        Main Entry Point for the SMTP Handler.
-        Returns (modified_mime_msg, status)
-        """
-        sender_email = mime_msg.get('From')
-        # Clean sender email from "Name <email@domain.com>" format
-        clean_sender = re.findall(r'[\w\.-]+@[\w\.-]+', sender_email)[0].lower()
+        """Main Entry Point for the SMTP Handler."""
+        sender_email = mime_msg.get('From', '')
+        match = re.search(r'[\w\.-]+@[\w\.-]+', sender_email)
+        if not match:
+            return mime_msg, 'BYPASS'
         
+        clean_sender = match.group(0).lower()
         self.tx.sender = clean_sender
-        await sync_to_async(self.tx.save)()
+        await sync_to_async(self.tx.save, thread_sensitive=True)()
 
         # 1. Identify User
-        user = await sync_to_async(LexUser.objects.filter(
-            tenant=self.tenant, 
-            email__iexact=clean_sender, 
-            is_active=True
-        ).first)()
+        user = await sync_to_async(
+            lambda: LexUser.objects.filter(
+                tenant=self.tenant, 
+                email__iexact=clean_sender, 
+                is_active=True
+            ).first(), 
+            thread_sensitive=True
+        )()
 
         if not user:
             await self.log_event('directory_user_missing', f"No active user found for {clean_sender}")
             self.tx.status = 'bypassed'
+            await sync_to_async(self.tx.save)()
             return mime_msg, 'BYPASS'
 
         self.tx.directory_user = user
         await self.log_event('directory_user_matched', f"User matched: {user.display_name}")
 
-        # 2. Match Policy
-        policy = await sync_to_async(self.get_matching_policy)(user)
+        # 2. Match Policy (Wrapped in sync_to_async)
+        policy = await sync_to_async(self._get_matching_policy_sync, thread_sensitive=True)(user)
         if not policy:
-            await self.log_event('policy_not_matched', "No matching policy found for user attributes")
+            await self.log_event('policy_not_matched', "No matching policy found")
             self.tx.status = 'bypassed'
+            await sync_to_async(self.tx.save)()
             return mime_msg, 'BYPASS'
 
         self.tx.policy_applied = policy
         await self.log_event('policy_matched', f"Policy applied: {policy.name}")
 
-        # 3. Determine Template (Initial vs Reply)
+        # 3. Determine Template (Fetch FKs safely)
         is_reply = 'In-Reply-To' in mime_msg or 'References' in mime_msg
-        template = policy.reply_signature if is_reply and policy.reply_signature else policy.initial_signature
+        initial_sig, reply_sig = await self._get_templates_sync(policy)
+        
+        template = reply_sig if is_reply and reply_sig else initial_sig
         
         if not template:
             await self.log_event('processing_bypassed', "Policy matched but no template assigned")
             self.tx.status = 'bypassed'
+            await sync_to_async(self.tx.save)()
             return mime_msg, 'BYPASS'
 
         self.tx.template_applied = template
@@ -162,48 +165,46 @@ class SignatureEngine:
             modified_msg = self.inject_html_signature(mime_msg, rendered_sig, is_reply)
             self.tx.status = 'signed'
             self.tx.processed_at = timezone.now()
-            await self.log_event('processing_completed', "Signature successfully injected into MIME")
+            await self.log_event('processing_completed', "Signature successfully injected")
+            await sync_to_async(self.tx.save)()
             return modified_msg, 'SIGNED'
         except Exception as e:
             await self.log_event('processing_failed', f"MIME injection error: {str(e)}", level='error')
             self.tx.status = 'failed'
             self.tx.error_message = str(e)
+            await sync_to_async(self.tx.save)()
             return mime_msg, 'FAILED'
 
     def inject_html_signature(self, msg, signature_html, is_reply):
-        """
-        Handles the actual HTML insertion. 
-        In production, we strictly target the HTML part of the multipart message.
-        """
         if not msg.is_multipart():
-            # For simplicity in this snippet, we assume multipart/alternative
             return msg
 
         for part in msg.walk():
             if part.get_content_type() == "text/html":
-                original_html = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8')
-                soup = BeautifulSoup(original_html, 'html.parser')
+                try:
+                    payload = part.get_payload(decode=True)
+                    charset = part.get_content_charset() or 'utf-8'
+                    original_html = payload.decode(charset, errors='replace')
+                    
+                    soup = BeautifulSoup(original_html, 'html.parser')
+                    sig_container = f'<div class="lexnote-signature" style="margin-top:20px;">{signature_html}</div>'
+                    sig_soup = BeautifulSoup(sig_container, 'html.parser')
 
-                # Create signature container
-                sig_soup = BeautifulSoup(f'<div class="lexnote-signature">{signature_html}</div>', 'html.parser')
-
-                if is_reply:
-                    # In replies, we try to insert BEFORE the first <blockquote> or 'MSExchange' thread separator
-                    separator = soup.find(['blockquote', 'div'], id=re.compile(r'appendonsend|divRplyFwdMsg|Signature', re.I))
-                    if separator:
-                        separator.insert_before(sig_soup)
-                    else:
-                        # Fallback for replies: insert at the top of body
-                        if soup.body:
+                    if is_reply:
+                        # Target common thread separators
+                        separator = soup.find(['blockquote', 'div', 'hr'], id=re.compile(r'appendonsend|divRplyFwdMsg|Signature|x_divRplyFwdMsg', re.I))
+                        if separator:
+                            separator.insert_before(sig_soup)
+                        elif soup.body:
                             soup.body.insert(0, sig_soup)
-                else:
-                    # Initial email: append to the end of the body
-                    if soup.body:
-                        soup.body.append(sig_soup)
                     else:
-                        soup.append(sig_soup)
+                        if soup.body:
+                            soup.body.append(sig_soup)
+                        else:
+                            soup.append(sig_soup)
 
-                part.set_payload(str(soup).encode('utf-8'))
+                    part.set_payload(str(soup).encode(charset))
+                except Exception as e:
+                    logger.error(f"Error injecting signature: {e}")
                 break
-        
         return msg
