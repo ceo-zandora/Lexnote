@@ -1,0 +1,13 @@
+django
+requests
+gunicorn
+psycopg2-binary
+celery
+redis
+requests-oauthlib
+beautifulsoup4
+aiosmtpd
+aiohttp
+msal
+django-environ
+httpx
