@@ -23,9 +23,9 @@ class UserInline(admin.TabularInline):
 
 @admin.register(Tenant)
 class TenantAdmin(admin.ModelAdmin):
-    list_display = ('organization_name', 'tenant_id', 'relay_domain', 'is_active', 'last_sync_status')
+    list_display = ('name', 'tenant_id', 'relay_domain', 'is_active', 'last_sync_status')
     list_filter = ('is_active',)
-    search_fields = ('organization_name', 'tenant_id', 'relay_domain')
+    search_fields = ('name', 'tenant_id', 'relay_domain')
     inlines = [GroupInline]
     
     def last_sync_status(self, obj):

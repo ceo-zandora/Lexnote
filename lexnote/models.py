@@ -16,7 +16,7 @@ class TimeStampedModel(models.Model):
         abstract = True
 
 class Tenant(TimeStampedModel):
-    organization_name = models.CharField(max_length=255)
+    name = models.CharField(max_length=255)
     tenant_id = models.CharField(max_length=255, unique=True, help_text="M365 Directory ID")
     client_id = models.CharField(max_length=255)
     client_secret = models.CharField(max_length=255)
@@ -25,7 +25,7 @@ class Tenant(TimeStampedModel):
     last_sync = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
-        return f"{self.organization_name} ({self.tenant_id})"
+        return f"{self.name} ({self.tenant_id})"
 
 class Group(TimeStampedModel):
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="groups")
@@ -131,7 +131,7 @@ class Policy(TimeStampedModel):
         ]
 
     def __str__(self):
-        return f"P{self.priority}: {self.name} ({self.tenant.organization_name})"
+        return f"P{self.priority}: {self.name} ({self.tenant.name})"
 
 class TransactionLog(TimeStampedModel):
     STATUS_CHOICES = [
