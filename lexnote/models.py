@@ -153,6 +153,8 @@ class TransactionLog(TimeStampedModel):
     
     # Core Identity
     sender = models.EmailField(db_index=True, blank=True, null=True)
+    recipients = models.JSONField(default=dict) 
+    cross_tenant_id = models.CharField(max_length=255, null=True, blank=True)
     internet_message_id = models.CharField(max_length=998, blank=True, db_index=True)
     
     # Status & Resolution
